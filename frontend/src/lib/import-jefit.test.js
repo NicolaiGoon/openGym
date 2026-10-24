@@ -117,8 +117,8 @@ describe('parseJefitExport', () => {
     const w = p.workouts.workouts
     expect(w).toHaveLength(3)
     expect(w.map(x => x.d)).toEqual([...w.map(x => x.d)].sort())
-    expect(w[0].name).toBe('Upper')
-    expect(w[1].name).toBe('Lower')
+    expect(w[0].name).toBe('Upper, Lower · Upper')
+    expect(w[1].name).toBe('Upper, Lower · Lower')
     // Session 99 is not in WORKOUT SESSIONS: filed under its own date.
     expect(w[2].d).toBe('2024-01-20')
     expect(w[2].name).toBe('Imported')
@@ -201,13 +201,13 @@ describe('merging', () => {
     const S = freshState()
     const first = parseJefitExport(FIXTURE, { unit: 'kg' })
     expect(mergeImport(S, first.workouts).added).toBe(3)
-    expect(mergeJefitRoutines(S, first.routines)).toEqual({ added: 2, updated: 0 })
+    expect(mergeJefitRoutines(S, first.routines, first.workouts)).toMatchObject({ added: 2, updated: 0 })
     expect(mergeImport(S, first.bodyweight).added).toBe(2)
     const customs = S.customEx.length
 
     const second = parseJefitExport(FIXTURE, { unit: 'kg', customEx: S.customEx })
     expect(mergeImport(S, second.workouts).added).toBe(0)
-    expect(mergeJefitRoutines(S, second.routines)).toEqual({ added: 0, updated: 2 })
+    expect(mergeJefitRoutines(S, second.routines, second.workouts)).toMatchObject({ added: 0, updated: 2, linked: 0 })
     expect(mergeImport(S, second.bodyweight).added).toBe(0)
     expect(S.workouts).toHaveLength(3)
     expect(S.routines).toHaveLength(2)
@@ -219,5 +219,75 @@ describe('merging', () => {
     const p = parseJefitExport(FIXTURE, { unit: 'kg' })
     mergeJefitRoutines(S, p.routines)
     for (const r of S.routines) for (const e of r.ex) expect(!!EXIDX[e.id] || S.customEx.some(c => c.id === e.id)).toBe(true)
+  })
+})
+
+describe('programs and their days', () => {
+  const TODAY = '2026-10-24', NOW = new Date('2026-10-24T09:00:00').getTime()
+
+  it('files each workout under the routine of the Jefit day it was trained on', () => {
+    const S = freshState()
+    const p = parseJefitExport(FIXTURE, { unit: 'kg' })
+    mergeImport(S, p.workouts)
+    const res = mergeJefitRoutines(S, p.routines, p.workouts, TODAY, NOW)
+    expect(res.linked).toBe(0)   // already carried their routine from the parse
+    const upper = S.routines.find(r => r.name.endsWith('Upper'))
+    const lower = S.routines.find(r => r.name.endsWith('Lower'))
+    const [w1, w2, w3] = S.workouts
+    expect(w1).toMatchObject({ routineId: upper.id, routineIds: [upper.id] })
+    expect(w2).toMatchObject({ routineId: lower.id, routineIds: [lower.id] })
+    // No session in the file, so no day to file it under.
+    expect(w3.routineId).toBeNull()
+  })
+
+  it('makes the program Jefit had selected the rotation, its days in order, when there is no schedule', () => {
+    const S = freshState()
+    const p = parseJefitExport(FIXTURE, { unit: 'kg' })
+    const res = mergeJefitRoutines(S, p.routines, p.workouts, TODAY, NOW)
+    expect(res.scheduled).toBe('Upper, Lower')
+    const names = S.rotation.sequence.map(id => S.routines.find(r => r.id === id).name)
+    expect(names).toEqual(['Upper, Lower · Upper', 'Upper, Lower · Lower'])
+    expect(S.queue).toMatchObject({ ids: S.rotation.sequence, label: 'Upper, Lower', rotationId: S.rotation.id })
+    expect(S.scheduleMode).toBe('rotation')
+  })
+
+  it('leaves a schedule the user already has alone', () => {
+    const S = { ...freshState(), routines: [{ id: 'mine', name: 'Mine', ex: [] }], week: { mon: ['mine'] } }
+    const p = parseJefitExport(FIXTURE, { unit: 'kg' })
+    expect(mergeJefitRoutines(S, p.routines, p.workouts, TODAY, NOW).scheduled).toBeNull()
+    expect(S.rotation).toBeUndefined()
+    expect(S.queue).toBeFalsy()
+  })
+
+  it('links the workouts of an earlier import that had no routines yet', () => {
+    const S = freshState()
+    const p = parseJefitExport(FIXTURE, { unit: 'kg' })
+    // What the first version of the import stored: the same workouts, under no routine.
+    mergeImport(S, { ...p.workouts, workouts: p.workouts.workouts.map(w => { const { routineIds, ...rest } = w; return { ...rest, routineId: null } }) })
+    const again = parseJefitExport(FIXTURE, { unit: 'kg', customEx: S.customEx })
+    expect(mergeImport(S, again.workouts).added).toBe(0)
+    expect(mergeJefitRoutines(S, again.routines, again.workouts, TODAY, NOW).linked).toBe(2)
+    expect(S.workouts.filter(w => w.routineId).map(w => S.routines.find(r => r.id === w.routineId).name))
+      .toEqual(['Upper, Lower · Upper', 'Upper, Lower · Lower'])
+  })
+
+  it('points the history at routines an earlier import made under other ids', () => {
+    const S = freshState()
+    const p = parseJefitExport(FIXTURE, { unit: 'kg' })
+    mergeImport(S, p.workouts)
+    // Routines from the first version of the import: random ids, matched again by their Jefit day.
+    p.routines.routines.forEach((r, i) => S.routines.push({ ...r, id: 'old' + i }))
+    mergeJefitRoutines(S, p.routines, p.workouts, TODAY, NOW)
+    expect(S.routines.map(r => r.id)).toEqual(['old0', 'old1'])
+    expect(S.workouts.slice(0, 2).map(w => w.routineId)).toEqual(['old0', 'old1'])
+  })
+
+  it('never re-files a workout the user moved to another routine', () => {
+    const S = freshState()
+    const p = parseJefitExport(FIXTURE, { unit: 'kg' })
+    mergeImport(S, p.workouts)
+    S.workouts[0].routineId = 'elsewhere'; S.workouts[0].routineIds = ['elsewhere']
+    mergeJefitRoutines(S, p.routines, p.workouts, TODAY, NOW)
+    expect(S.workouts[0].routineId).toBe('elsewhere')
   })
 })

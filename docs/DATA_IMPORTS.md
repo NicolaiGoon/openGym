@@ -57,12 +57,17 @@ Jefit export on its own and shows what it found, with a switch for each part:
   name. Exercise notes are attached to the exercise on the day they were written.
 - **Routines**: each day of a Jefit routine becomes a routine here (for example *Upper, Lower · Upper*),
   with its sets, rest time and the weight you last used. Rep targets that differ from set to set
-  (12, 10, 8) become pyramid sets.
+  (12, 10, 8) become pyramid sets. Each imported workout is filed under the routine of the day it
+  was trained on, so that routine's history and last-time numbers include your Jefit sessions.
+  openGym has no folder of days per program: the days of one program sit side by side under the
+  program's name, and the program you had selected in Jefit becomes your **rotation** (its days
+  one after the other), unless you already set up a weekly plan or a rotation here.
 - **Weigh-ins** from your Jefit profile.
 
 Weights are converted when Jefit and openGym use different units. Importing the same export again
 adds no workouts or weigh-ins twice, and updates the routines it brought last time instead of adding
-copies.
+copies. Importing it again with routines switched on also files workouts from an
+earlier import under their routines.
 
 ## Body weight from Apple Health
 

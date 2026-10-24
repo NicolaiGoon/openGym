@@ -22,7 +22,9 @@
 // under several names, sometimes an empty one; the id is the identity and the newest name wins.
 
 import { EXIDX, canonicalExId } from './exercises.js'
-import { uid } from './format.js'
+import { todayISO } from './format.js'
+import { queueOf } from './queue.js'
+import { saveRotation } from './rotation.js'
 import { isWarmupRow } from './workout-model.js'
 import { bpFromName, importId, matchExercise, priorCustom } from './import-csv.js'
 
@@ -114,6 +116,7 @@ export function readJefitExport(input) {
 
   const setting = records('SETTING')[0] || {}
   const massUnit = text(setting.mass) === 'lb' ? 'lb' : 'kg'
+  const currentRoutine = num(setting.currentRoutine)
 
   let skipped = 0
   const logs = []
@@ -161,7 +164,7 @@ export function readJefitExport(input) {
     .map(r => ({ key: keyOf(r.belongSys, r.eid), date: text(r.mydate), text: text(r.mynote) }))
     .filter(n => n.text)
 
-  return { massUnit, logs, sessions, routines, days, routineEx, customs, weighIns, notes, skipped }
+  return { massUnit, currentRoutine, logs, sessions, routines, days, routineEx, customs, weighIns, notes, skipped }
 }
 
 /* ------------------------------------------------------------ exercises --- */
@@ -236,10 +239,9 @@ function localWhen(sec) {
  * Jefit's logs as workouts in the shape mergeImport takes. One workout per Jefit session; a log
  * whose session is missing from the file joins the others of its day.
  */
-function jefitWorkouts(data, R, unit) {
+function jefitWorkouts(data, R, unit, byDay) {
   const conv = converter(data.massUnit, unit)
   const maxW = data.massUnit === 'lb' ? MAX_KG / LB_TO_KG : MAX_KG
-  const dayName = new Map(data.days.map(d => [d.id, d.name]))
   const notes = new Map()  // date|key → [text]
   for (const n of data.notes) {
     const k = n.date + '|' + n.key
@@ -260,7 +262,7 @@ function jefitWorkouts(data, R, unit) {
       const base = new Date(d + 'T00:00:00').getTime()
       const startMs = start ? base + start.t : base + 18 * 3600000
       const endMs = session && session.end > session.start ? session.end * 1000 : startMs
-      g = { key: gk, d, start: startMs, end: endMs, name: (session && dayName.get(session.dayId)) || '', ex: new Map() }
+      g = { key: gk, d, start: startMs, end: endMs, routine: (session && byDay.get(session.dayId)) || null, ex: new Map() }
       groups.set(gk, g)
     }
     const good = log.sets.filter(s => s.w <= maxW && s.r <= MAX_REPS)
@@ -286,7 +288,10 @@ function jefitWorkouts(data, R, unit) {
       const w = {
         // From the Jefit session, so the same export imported on two devices merges into one.
         id: importId('iw', 'Jefit|' + g.key), d: g.d, start: g.start, end: g.end > g.start ? g.end : g.start,
-        routineId: null, name: g.name || 'Imported', entries, prs: [],
+        // The routine of the Jefit day it was trained on, as a workout started from that routine
+        // here would be: its history then counts as that routine's.
+        routineId: g.routine ? g.routine.id : null, ...(g.routine ? { routineIds: [g.routine.id] } : {}),
+        name: g.routine ? g.routine.name : 'Imported', entries, prs: [],
       }
       w.vol = entries.reduce((a, e) => a + e.sets.reduce((b, s) => b + (s.w || 0) * (s.r || 0), 0), 0)
       return w
@@ -319,27 +324,62 @@ function jefitRoutines(data, R, unit) {
       if (!ex.length) return
       const dayLabel = day.name || 'Day ' + (i + 1)
       const name = days.length > 1 && routine.name ? routine.name + ' · ' + dayLabel : routine.name || dayLabel
-      out.push({ jefitId: routine.id + ':' + day.id, name: name.slice(0, 80), emoji: 'figureStrength', ex })
+      const jefitId = routine.id + ':' + day.id
+      // From the Jefit day, so the workouts read from the same file can name it before the merge.
+      out.push({ id: importId('ir', 'Jefit|' + jefitId), jefitId, dayId: day.id, programId: routine.id, name: name.slice(0, 80), emoji: 'figureStrength', ex })
     })
   }
   return out
 }
 
-/** Merge Jefit routines into state. A routine an earlier import brought (same Jefit day) is
- *  replaced in place, so importing the export twice does not double the plan. */
-export function mergeJefitRoutines(S, parsed) {
+/**
+ * Merge Jefit routines into state. A routine an earlier import brought (same Jefit day) is
+ * replaced in place, so importing the export twice does not double the plan. Then:
+ *  - the Jefit workouts already in the history (this import's or an earlier one's) are pointed at
+ *    the routine of the day they were trained on, so a routine's history and "last time" include
+ *    what was logged in Jefit;
+ *  - with no schedule set up yet, the program Jefit had selected becomes the rotation, its days in
+ *    Jefit's order — openGym's way of saying "these days, one after the other".
+ * `workouts`: the parsed workouts of the same file, whether or not they are being imported now.
+ */
+export function mergeJefitRoutines(S, parsed, workouts = null, today = todayISO(), now = Date.now()) {
   S.customEx = S.customEx || []
   S.routines = S.routines || []
   const known = new Set(S.customEx.map(c => c && c.id))
   for (const c of parsed.customEx || []) if (!known.has(c.id)) { S.customEx.push(c); known.add(c.id) }
   let added = 0, updated = 0
+  const idOf = new Map()   // parsed routine id → the id it has in state
   for (const r of parsed.routines || []) {
     const existing = S.routines.find(x => x.jefitId === r.jefitId)
-    if (existing) { existing.name = r.name; existing.ex = r.ex; updated++; continue }
-    S.routines.push({ id: uid(), name: r.name, emoji: r.emoji, jefitId: r.jefitId, ex: r.ex })
+    if (existing) { existing.name = r.name; existing.ex = r.ex; idOf.set(r.id, existing.id); updated++; continue }
+    S.routines.push({ id: r.id, name: r.name, emoji: r.emoji, jefitId: r.jefitId, ex: r.ex })
+    idOf.set(r.id, r.id)
     added++
   }
-  return { added, updated }
+
+  let linked = 0
+  const byId = new Map((S.workouts || []).map(w => [w.id, w]))
+  for (const w of workouts?.workouts || []) {
+    const rid = idOf.get(w.routineId)
+    const here = byId.get(w.id)
+    if (!rid || !here) continue
+    // Only a workout this import made and nobody has re-filed: no routine, or the one it was given.
+    const cur = [].concat(here.routineIds ?? [])[0] ?? here.routineId ?? null
+    if (cur === rid || (cur && cur !== w.routineId)) continue
+    here.routineId = rid
+    here.routineIds = [rid]
+    linked++
+  }
+
+  let scheduled = null
+  const seq = (parsed.current?.ids || []).map(id => idOf.get(id)).filter(Boolean)
+  const hasWeek = Object.values(S.week || {}).some(v => [].concat(v).length)
+  if (seq.length && !queueOf(S) && !S.rotation && !hasWeek) {
+    saveRotation(S, seq, parsed.current.label, today, now)
+    S.scheduleMode = 'rotation'
+    scheduled = parsed.current.label
+  }
+  return { added, updated, linked, scheduled }
 }
 
 /* ---------------------------------------------------------- body weight --- */
@@ -366,8 +406,12 @@ export function parseJefitExport(input, { unit = 'kg', customEx = [] } = {}) {
   const data = readJefitExport(input)
   if (data.error) return data
   const R = makeResolver(data, customEx)
-  const w = jefitWorkouts(data, R, unit)
   const routines = jefitRoutines(data, R, unit)
+  const byDay = new Map(routines.map(r => [r.dayId, r]))
+  const w = jefitWorkouts(data, R, unit, byDay)
+  // The program Jefit had selected, as the days it trains in order.
+  const program = data.routines.find(r => r.id === data.currentRoutine)
+  const current = program ? { ids: routines.filter(r => r.programId === program.id).map(r => r.id), label: program.name } : null
   const bodyweight = jefitBodyweight(data, unit)
   const usedW = new Set(w.workouts.flatMap(x => x.entries.map(e => e.id)))
   const usedR = new Set(routines.flatMap(r => r.ex.map(e => e.id)))
@@ -382,7 +426,7 @@ export function parseJefitExport(input, { unit = 'kg', customEx = [] } = {}) {
       from: dates[0] || null, to: dates[dates.length - 1] || null,
     },
     routines: {
-      kind: 'routines', source: 'Jefit', routines, customEx: R.customEx(usedR),
+      kind: 'routines', source: 'Jefit', routines: routines.map(({ dayId, programId, ...r }) => r), current, customEx: R.customEx(usedR),
       matched: R.matchedCount(usedR), created: R.customEx(usedR).length, unmatchedNames: R.unmatchedNames(usedR),
       exerciseCount: routines.reduce((n, r) => n + r.ex.length, 0), converted,
     },
