@@ -531,7 +531,7 @@ function importJefit(text, onDone) {
     toast(t('Nothing to import from that file')); return
   }
   const { fileUnit } = payload.workouts
-  ui().openSheet(close => <ImportReview payload={payload} title={t('Import from {0}', 'Jefit')} mergeRoutines={mergeJefitRoutines}
+  ui().openSheet(close => <ImportReview payload={payload} title={t('Import from {0}', 'Jefit')} mergeRoutines={(s, r) => mergeJefitRoutines(s, r, payload.workouts)}
     unitNote={t('The file is in {0} and your profile is in {1}, so weights get converted.', fileUnit, S().unit)}
     back={<Button variant="ghost" className="dim" onClick={close}>{t('Cancel')}</Button>}
     close={close} />)
@@ -653,8 +653,9 @@ function ImportReview({ payload, title, mergeRoutines, unitNote, back, close }) 
       }
       if (wantRoutines && payload.routines.routines.length) {
         const res = mergeRoutines(s, payload.routines)
-        addedR = res.added
-        parts.push(tn('{0} routine imported', '{0} routines imported', res.added))
+        // A routine a second import replaces in place came in all the same.
+        addedR = res.added + (res.updated || 0)
+        parts.push(tn('{0} routine imported', '{0} routines imported', addedR))
       }
       if (wantBody && payload.bodyweight.bodyweight.length) {
         const res = mergeImport(s, payload.bodyweight)
